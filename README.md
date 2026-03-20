@@ -1,3 +1,5 @@
+![Screenshot](screenshot.png)
+
 # gbe_fork Auto Patcher
 
 A Windows GUI tool that automatically patches Steam games with the [gbe_fork](https://github.com/Detanup01/gbe_fork) Steam emulator. It scans your Steam library, detects games, fetches info from the Steam Store API, generates all required configs, and replaces `steam_api64.dll` / `steam_api.dll` in one click.
