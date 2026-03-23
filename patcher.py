@@ -12,7 +12,7 @@ GBE_URL    = "https://github.com/Detanup01/gbe_fork/releases/latest/download/emu
 STEAM_API    = "https://store.steampowered.com/api/appdetails?appids={appid}&l=english"
 
 CONFIG_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patcher_config.json")
-DEFAULT_STEAM_KEY = "67949A6CF3E5D7517358620BB74E9EFC"  # fallback key, overridden by config
+DEFAULT_STEAM_KEY = "YourSteamAPIKEYHERE"  # fallback key, overridden by config
 
 DARK = {
     "bg":       "#0d0d0f",
