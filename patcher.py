@@ -1,11 +1,18 @@
 import tkinter as tk
 from tkinter import ttk, filedialog
 import os, shutil, threading, random, re, winreg, urllib.request, urllib.parse, zipfile, io, json, time
+try:
+    from PIL import Image, ImageTk
+    _PIL = True
+except ImportError:
+    _PIL = False
 
 APP_TITLE  = "gbe_fork Patcher"
 GBE_URL    = "https://github.com/Detanup01/gbe_fork/releases/latest/download/emu-win-release.zip"
-STEAM_API  = "https://store.steampowered.com/api/appdetails?appids={appid}&l=english"
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patcher_config.json")
+STEAM_API    = "https://store.steampowered.com/api/appdetails?appids={appid}&l=english"
+
+CONFIG_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patcher_config.json")
+DEFAULT_STEAM_KEY = "67949A6CF3E5D7517358620BB74E9EFC"  # fallback key, overridden by config
 
 DARK = {
     "bg":       "#0d0d0f",
@@ -298,6 +305,332 @@ def scan_games(library_path):
 
 
 
+def gse_saves_path():
+    """Return the base GSE Saves directory on Windows."""
+    return os.path.join(os.environ.get("APPDATA", ""), "GSE Saves")
+
+def ach_save_file(appid):
+    """Path to the per-game unlocked achievements JSON written by gbe_fork."""
+    return os.path.join(gse_saves_path(), str(appid), "stats", "achievements.json")
+
+_RUNTIME_KEY = {"value": DEFAULT_STEAM_KEY}  # updated at runtime from config/UI
+
+def steam_api_key():
+    """Return the active Steam API key (config overrides hardcoded default)."""
+    return _RUNTIME_KEY["value"] or DEFAULT_STEAM_KEY
+
+def _ach_http_get(url, timeout=15):
+    """Simple HTTP GET helper, returns bytes or raises."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+def _ach_make_entry(name, display="", desc="", hidden="0", icon="", icongray=""):
+    """Build a normalised gbe_fork achievement dict."""
+    return {
+        "name":        name,
+        "displayName": display or name,
+        "description": desc,
+        "hidden":      str(hidden),
+        "icon":        icon,
+        "icongray":    icongray or icon,
+    }
+
+def _ach_source_schema_api(appid):
+    """
+    Source A — GetSchemaForGame?key=0&appid=X&l=english
+    -------------------------------------------------------
+    Fully public endpoint, no key required for most games.
+    Response path: game.availableGameStats.achievements[]
+    Fields we extract (all are top-level on each achievement object):
+      name        → API identifier      e.g. "ACH_WIN_DUEL"
+      displayName → Human title         e.g. "Duelist"
+      description → Unlock description  e.g. "Win 10 duels"
+      hidden      → 0 or 1 int
+      icon        → absolute HTTPS URL  (earned/color icon)
+      icongray    → absolute HTTPS URL  (unearned/gray icon)
+    Icons come back as full URLs already — no CDN prefix needed.
+    """
+    url = (f"https://api.steampowered.com/ISteamUserStats"
+           f"/GetSchemaForGame/v2/?key={steam_api_key()}&appid={appid}&l=english&format=json")
+    try:
+        raw = _ach_http_get(url, timeout=15)
+        data = json.loads(raw)
+        achs = (data.get("game", {})
+                    .get("availableGameStats", {})
+                    .get("achievements", []))
+        if not achs:
+            return []
+        return [_ach_make_entry(
+            name     = a.get("name",        ""),
+            display  = a.get("displayName", ""),
+            desc     = a.get("description", ""),
+            hidden   = str(a.get("hidden",  0)),
+            icon     = a.get("icon",        ""),
+            icongray = a.get("icongray",    ""),
+        ) for a in achs if a.get("name")]
+    except Exception:
+        return []
+
+def _ach_source_hover_content(appid):
+    """
+    Source B — store.steampowered.com/apphovercontent/<appid>/achievements
+    -----------------------------------------------------------------------
+    Returns a small HTML fragment used by the store hover popup.
+    Structure per achievement:
+      <div class="achievement_list_achievement">
+        <img src="ICON_URL" />
+        <div class="achievement_list_achievement_info">
+          <div class="ellipsis achievement_name">DISPLAY NAME</div>
+          <div class="achievement_description">DESCRIPTION</div>
+        </div>
+      </div>
+    No API names in this source — use displayName as name fallback.
+    Good coverage and always returns English text.
+    """
+    url = f"https://store.steampowered.com/apphovercontent/{appid}/achievements"
+    try:
+        html = _ach_http_get(url, timeout=15).decode("utf-8", errors="replace")
+    except Exception:
+        return []
+
+    result = []
+    # Match each achievement block
+    for block in re.finditer(
+            r'<div[^>]+class="[^"]*achievement_list_achievement[^"]*"[^>]*>(.*?)</div\s*>\s*</div\s*>',
+            html, re.DOTALL | re.IGNORECASE):
+        chunk = block.group(1)
+        icon_m  = re.search(r'<img[^>]+src="([^"]+)"', chunk, re.IGNORECASE)
+        name_m  = re.search(r'class="[^"]*achievement_name[^"]*"[^>]*>\s*(.*?)\s*<', chunk, re.DOTALL | re.IGNORECASE)
+        desc_m  = re.search(r'class="[^"]*achievement_description[^"]*"[^>]*>\s*(.*?)\s*<', chunk, re.DOTALL | re.IGNORECASE)
+        disp = re.sub(r'<[^>]+>', '', name_m.group(1)).strip() if name_m else ""
+        desc = re.sub(r'<[^>]+>', '', desc_m.group(1)).strip() if desc_m else ""
+        icon = icon_m.group(1).strip() if icon_m else ""
+        if disp:
+            result.append(_ach_make_entry(name=disp, display=disp, desc=desc, icon=icon))
+    return result
+
+def _ach_source_global_names(appid):
+    """
+    Source C — GetGlobalAchievementPercentagesForApp (last resort)
+    --------------------------------------------------------------
+    Returns API names only — no displayName or description.
+    Used only when both A and B fail, so the list is at least populated.
+    """
+    url = (f"https://api.steampowered.com/ISteamUserStats"
+           f"/GetGlobalAchievementPercentagesForApp/v2/?key={steam_api_key()}&gameid={appid}&format=json")
+    try:
+        data = json.loads(_ach_http_get(url, timeout=12))
+        entries = data.get("achievementpercentages", {}).get("achievements", [])
+        return [e["name"] for e in entries if e.get("name")]
+    except Exception:
+        return []
+
+def fetch_achievements_schema(appid):
+    """
+    Fetch full achievement definitions (displayName + description + icons).
+    No API key required.
+
+    Pipeline (fastest-wins parallel fetch):
+      A. GetSchemaForGame?key=0   — primary, full data when available
+      B. apphovercontent HTML     — fallback with display names + descriptions
+      C. GlobalAchievementPercentages — last resort, API names only
+
+    A and B run in parallel. Results are merged so each field is filled
+    from whichever source has it. C runs only if both A and B return nothing.
+    """
+    out = {}
+    def run_a(o): o["a"] = _ach_source_schema_api(appid)
+    def run_b(o): o["b"] = _ach_source_hover_content(appid)
+    ta = threading.Thread(target=run_a, args=(out,), daemon=True)
+    tb = threading.Thread(target=run_b, args=(out,), daemon=True)
+    ta.start(); tb.start()
+    ta.join(timeout=20); tb.join(timeout=20)
+
+    schema_a = out.get("a", [])   # full data: name + displayName + desc + icons
+    schema_b = out.get("b", [])   # displayName + desc + icon (no API name)
+
+    # If A worked it's the best source — use it as base, then fill any missing
+    # displayName/description/icon gaps from B (matched by position, since
+    # hover content has no API names).
+    if schema_a:
+        if schema_b:
+            # B is ordered the same as A — zip to fill gaps
+            for i, entry_a in enumerate(schema_a):
+                if i >= len(schema_b):
+                    break
+                entry_b = schema_b[i]
+                if not entry_a.get("displayName") or entry_a["displayName"] == entry_a["name"]:
+                    entry_a["displayName"] = entry_b.get("displayName") or entry_a["displayName"]
+                if not entry_a.get("description"):
+                    entry_a["description"] = entry_b.get("description", "")
+                if not entry_a.get("icon"):
+                    entry_a["icon"] = entry_b.get("icon", "")
+                if not entry_a.get("icongray"):
+                    entry_a["icongray"] = entry_b.get("icongray", "")
+        return schema_a
+
+    # A failed — use B (displayName as name, since hover has no API names)
+    if schema_b:
+        return schema_b
+
+    # Both failed — last resort: API names only from global percentages
+    names = _ach_source_global_names(appid)
+    if names:
+        return [_ach_make_entry(name=n) for n in names]
+
+    return []
+
+def read_unlocked_achievements(appid):
+    """
+    Read %APPDATA%/GSE Saves/<AppID>/stats/achievements.json.
+    Returns dict: api_name -> {"earned": bool, "earned_time": int}
+    """
+    path = ach_save_file(appid)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def write_unlocked_achievements(appid, state):
+    """
+    Write the unlocked achievements dict back to disk.
+    state: dict api_name -> {"earned": bool, "earned_time": int}
+    """
+    path = ach_save_file(appid)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+
+# ── ICON HELPERS ──────────────────────────────────────────────────────────────
+
+_ICON_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ach_icons")
+_ICON_MEM_CACHE = {}
+
+def _icon_url(appid, raw_icon):
+    if not raw_icon:
+        return None
+    if raw_icon.startswith("http"):
+        return raw_icon.replace("http://", "https://")
+    return f"https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/{appid}/{raw_icon}"
+
+def _icon_cache_path(url):
+    safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", url.split("/")[-1])
+    return os.path.join(_ICON_CACHE_DIR, safe)
+
+def load_icon_sync(appid, raw_icon, size=36, local_base=None):
+    """
+    Load an achievement icon as a PhotoImage.
+    raw_icon may be:
+      - a local relative path like "images/ACH_WIN.jpg"  (preferred)
+      - a full https:// URL  (downloaded + cached to disk)
+    local_base: absolute path to the steam_settings/ folder so relative
+                paths can be resolved. If None, falls back to URL mode.
+    """
+    if not _PIL or not raw_icon:
+        return None
+
+    # ── Local file (relative path stored in achievements.json) ────────────────
+    if local_base and not raw_icon.startswith("http"):
+        abs_path = os.path.join(local_base, raw_icon)
+        if os.path.isfile(abs_path):
+            cache_key = abs_path
+            if cache_key in _ICON_MEM_CACHE:
+                return _ICON_MEM_CACHE[cache_key]
+            try:
+                img   = Image.open(abs_path).convert("RGBA").resize((size, size), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                _ICON_MEM_CACHE[cache_key] = photo
+                return photo
+            except Exception:
+                return None
+
+    # ── Remote URL ─────────────────────────────────────────────────────────────
+    url = _icon_url(appid, raw_icon)
+    if not url:
+        return None
+    if url in _ICON_MEM_CACHE:
+        return _ICON_MEM_CACHE[url]
+    os.makedirs(_ICON_CACHE_DIR, exist_ok=True)
+    disk = _icon_cache_path(url)
+    try:
+        if not os.path.isfile(disk):
+            data = _ach_http_get(url, timeout=10)
+            with open(disk, "wb") as f:
+                f.write(data)
+        img   = Image.open(disk).convert("RGBA").resize((size, size), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(img)
+        _ICON_MEM_CACHE[url] = photo
+        return photo
+    except Exception:
+        return None
+
+def make_placeholder_icon(size=36, unlocked=True):
+    if not _PIL:
+        return None
+    color = (90, 184, 122, 255) if unlocked else (85, 85, 104, 255)
+    img = Image.new("RGBA", (size, size), color)
+    return ImageTk.PhotoImage(img)
+
+
+def download_achievement_images(appid, schema, images_dir, log_cb=None):
+    """
+    Download icon + icongray for every achievement in schema.
+    Saves to: images_dir/{api_name}.jpg  and  images_dir/{api_name}_gray.jpg
+    Replaces the "icon" and "icongray" fields in each entry with the local
+    relative path  (e.g.  "images/ACH_WIN.jpg").
+    Returns the mutated schema list.
+    """
+    os.makedirs(images_dir, exist_ok=True)
+    total   = len(schema)
+    done    = 0
+    errors  = 0
+
+    for entry in schema:
+        api_name = entry.get("name","").strip()
+        if not api_name:
+            continue
+
+        for field, suffix in [("icon", ""), ("icongray", "_gray")]:
+            url = entry.get(field, "")
+            if not url or not url.startswith("http"):
+                continue
+            # Determine file extension from URL (jpg or png)
+            ext = ".png" if url.lower().endswith(".png") else ".jpg"
+            filename  = f"{api_name}{suffix}{ext}"
+            local_abs = os.path.join(images_dir, filename)
+            # Relative path stored in JSON (relative to steam_settings/)
+            local_rel = os.path.join("images", filename)
+
+            # Skip if already downloaded
+            if not os.path.isfile(local_abs):
+                try:
+                    data = _ach_http_get(url, timeout=12)
+                    with open(local_abs, "wb") as f:
+                        f.write(data)
+                except Exception as ex:
+                    errors += 1
+                    if log_cb:
+                        log_cb(f"  [img] failed {filename}: {ex}")
+                    continue
+
+            # Replace URL with local relative path
+            entry[field] = local_rel
+
+        done += 1
+        if log_cb and done % 10 == 0:
+            log_cb(f"  [img] {done}/{total} icons downloaded...")
+
+    if log_cb:
+        log_cb(f"  [img] done — {done} processed, {errors} errors")
+    return schema
+
+
 def load_config():
     """Load saved settings from JSON, return dict (empty if missing/corrupt)."""
     try:
@@ -320,8 +653,8 @@ class PatcherApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("940x720")
-        self.minsize(800, 580)
+        self.geometry("1080x780")
+        self.minsize(900, 620)
         self.configure(bg=DARK["bg"])
         self.resizable(True, True)
 
@@ -330,10 +663,19 @@ class PatcherApp(tk.Tk):
         self.lib_path   = tk.StringVar(value=self._cfg.get("library_path", ""))
         self.username   = tk.StringVar(value=self._cfg.get("username", "Player"))
         self.steamid    = tk.StringVar(value=self._cfg.get("steamid", random_steamid()))
+        _k = self._cfg.get("steam_api_key", DEFAULT_STEAM_KEY)
+        self.api_key    = tk.StringVar(value=_k)
+        _RUNTIME_KEY["value"] = _k  # apply immediately
         self.gbe64      = None
         self.gbe32      = None
         self.dl_status  = tk.StringVar(value="")
         self._saved_dll = self._cfg.get("dll_path", "")   # path to cached DLL on disk
+
+        self._ach_game_idx  = None   # currently selected game in ach tab
+        self._icon_refs     = []     # keep PhotoImage refs alive (prevent GC)
+        self._ach_schema    = []     # definitions list
+        self._ach_state     = {}     # unlocked state dict
+        self._ach_filter    = tk.StringVar(value="all")  # all/unlocked/locked
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -400,6 +742,19 @@ class PatcherApp(tk.Tk):
                  wraplength=230, justify="left").pack(fill="x", pady=(2,0))
 
         tk.Frame(p, bg=DARK["border"], height=1).pack(fill="x", pady=6)
+        self._lbl(p, "STEAM API KEY")
+        key_entry = tk.Entry(p, textvariable=self.api_key,
+                 bg=DARK["entry_bg"], fg=DARK["accent"], font=("Consolas",8),
+                 relief="flat", highlightthickness=1,
+                 highlightbackground=DARK["border"],
+                 insertbackground=DARK["text"], show="")
+        key_entry.pack(fill="x", pady=(0,4))
+        self.api_key.trace_add("write", lambda *_: self._on_api_key_change())
+        tk.Label(p, text="used for achievement schema fetching",
+                 font=("Consolas",7), fg=DARK["text2"],
+                 bg=DARK["bg"], anchor="w").pack(fill="x", pady=(0,6))
+
+        tk.Frame(p, bg=DARK["border"], height=1).pack(fill="x", pady=6)
         self._lbl(p, "STEAM LIBRARY")
         tk.Entry(p, textvariable=self.lib_path, bg=DARK["entry_bg"],
                  fg=DARK["text"], font=("Consolas",8), relief="flat",
@@ -421,8 +776,25 @@ class PatcherApp(tk.Tk):
                   command=self._search_all_appids, **self._bs("ghost")).pack(fill="x", pady=2)
 
     def _build_right(self, p):
-        hdr = tk.Frame(p, bg=DARK["bg"])
-        hdr.pack(fill="x", pady=(0,8))
+        # ── Tab bar ──
+        style = ttk.Style()
+        style.configure("Dark.TNotebook", background=DARK["bg"], borderwidth=0)
+        style.configure("Dark.TNotebook.Tab",
+                         background=DARK["surface"], foreground=DARK["text2"],
+                         font=("Consolas",9), padding=(12,5))
+        style.map("Dark.TNotebook.Tab",
+                  background=[("selected", DARK["accent2"])],
+                  foreground=[("selected", DARK["text"])])
+
+        self._nb = ttk.Notebook(p, style="Dark.TNotebook")
+        self._nb.pack(fill="both", expand=True)
+
+        # ── Tab 1: Games ──────────────────────────────────────────────────────
+        games_tab = tk.Frame(self._nb, bg=DARK["bg"])
+        self._nb.add(games_tab, text=" 🎮  games ")
+
+        hdr = tk.Frame(games_tab, bg=DARK["bg"])
+        hdr.pack(fill="x", pady=(8,6))
         self.count_lbl = tk.Label(hdr, text="0 games", font=("Consolas",10),
                                   fg=DARK["text2"], bg=DARK["bg"])
         self.count_lbl.pack(side="left")
@@ -431,7 +803,7 @@ class PatcherApp(tk.Tk):
         tk.Button(hdr, text="⚡ patch ALL",
                   command=self._patch_all, **self._bs("primary")).pack(side="right", padx=(4,4))
 
-        wrap = tk.Frame(p, bg=DARK["surface"],
+        wrap = tk.Frame(games_tab, bg=DARK["surface"],
                         highlightthickness=1, highlightbackground=DARK["border"])
         wrap.pack(fill="both", expand=True)
         self._canvas = tk.Canvas(wrap, bg=DARK["surface"], highlightthickness=0)
@@ -446,7 +818,327 @@ class PatcherApp(tk.Tk):
         self._canvas.bind_all("<MouseWheel>",
             lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
 
-    # ── STYLE HELPERS ─────────────────────────────────────────────────────────
+        # ── Tab 2: Achievements ───────────────────────────────────────────────
+        ach_tab = tk.Frame(self._nb, bg=DARK["bg"])
+        self._nb.add(ach_tab, text=" 🏆  achievements ")
+        self._build_ach_tab(ach_tab)
+
+    # ── ACHIEVEMENTS TAB ─────────────────────────────────────────────────────
+
+    def _build_ach_tab(self, p):
+        # Top bar: game selector + filter + actions
+        top = tk.Frame(p, bg=DARK["bg"])
+        top.pack(fill="x", pady=(8,4))
+
+        tk.Label(top, text="Game:", font=("Consolas",9),
+                 fg=DARK["text2"], bg=DARK["bg"]).pack(side="left", padx=(0,4))
+        self._ach_game_var = tk.StringVar(value="— select a game —")
+        self._ach_game_combo = ttk.Combobox(top, textvariable=self._ach_game_var,
+                                             state="readonly", font=("Consolas",9), width=34)
+        self._ach_game_combo.pack(side="left", padx=(0,8))
+        self._ach_game_combo.bind("<<ComboboxSelected>>", lambda e: self._ach_load_game())
+
+        tk.Button(top, text="⬇ fetch schema",
+                  command=self._ach_fetch_schema, **self._bs("primary")).pack(side="left", padx=2)
+        tk.Button(top, text="↺ reload saves",
+                  command=self._ach_reload_saves, **self._bs("ghost")).pack(side="left", padx=2)
+
+        # Filter radio buttons
+        filter_frame = tk.Frame(top, bg=DARK["bg"])
+        filter_frame.pack(side="right")
+        for val, label in [("all","all"), ("unlocked","✓ unlocked"), ("locked","○ locked")]:
+            tk.Radiobutton(filter_frame, text=label, variable=self._ach_filter, value=val,
+                           font=("Consolas",8), fg=DARK["text2"], bg=DARK["bg"],
+                           selectcolor=DARK["accent2"], activebackground=DARK["bg"],
+                           activeforeground=DARK["text"], command=self._ach_render,
+                           relief="flat", bd=0).pack(side="left", padx=4)
+
+        # Search bar
+        search_row = tk.Frame(p, bg=DARK["bg"])
+        search_row.pack(fill="x", pady=(0,4))
+        tk.Label(search_row, text="search:", font=("Consolas",8),
+                 fg=DARK["text2"], bg=DARK["bg"]).pack(side="left")
+        self._ach_search = tk.StringVar()
+        self._ach_search.trace_add("write", lambda *_: self._ach_render())
+        tk.Entry(search_row, textvariable=self._ach_search, bg=DARK["entry_bg"],
+                 fg=DARK["text"], font=("Consolas",9), relief="flat",
+                 highlightthickness=1, highlightbackground=DARK["border"],
+                 insertbackground=DARK["text"], width=30).pack(side="left", padx=(4,16))
+
+        # Bulk action buttons
+        tk.Button(search_row, text="✓ unlock ALL",
+                  command=self._ach_unlock_all, **self._bs("success")).pack(side="right", padx=2)
+        tk.Button(search_row, text="○ lock ALL",
+                  command=self._ach_lock_all, **self._bs("ghost")).pack(side="right", padx=2)
+
+        # Stats bar
+        self._ach_stats_lbl = tk.Label(p, text="", font=("Consolas",8),
+                                        fg=DARK["text2"], bg=DARK["bg"], anchor="w")
+        self._ach_stats_lbl.pack(fill="x", padx=2, pady=(0,4))
+
+        # Achievement list (scrollable)
+        wrap = tk.Frame(p, bg=DARK["surface"],
+                        highlightthickness=1, highlightbackground=DARK["border"])
+        wrap.pack(fill="both", expand=True)
+        self._ach_canvas = tk.Canvas(wrap, bg=DARK["surface"], highlightthickness=0)
+        ach_sb = ttk.Scrollbar(wrap, orient="vertical", command=self._ach_canvas.yview)
+        self._ach_frame = tk.Frame(self._ach_canvas, bg=DARK["surface"])
+        self._ach_frame.bind("<Configure>",
+            lambda e: self._ach_canvas.configure(
+                scrollregion=self._ach_canvas.bbox("all")))
+        self._ach_canvas.create_window((0,0), window=self._ach_frame, anchor="nw")
+        self._ach_canvas.configure(yscrollcommand=ach_sb.set)
+        self._ach_canvas.pack(side="left", fill="both", expand=True)
+        ach_sb.pack(side="right", fill="y")
+        self._ach_canvas.bind("<MouseWheel>",
+            lambda e: self._ach_canvas.yview_scroll(-1*(e.delta//120), "units"))
+
+    def _ach_update_combo(self):
+        """Refresh the game selector combobox from self.games."""
+        names = [f"{g.get('acf_name') or g['name']}  [{g['appid'] or '?'}]"
+                 for g in self.games]
+        self._ach_game_combo["values"] = names
+        if names and self._ach_game_idx is None:
+            self._ach_game_combo.current(0)
+            self._ach_game_idx = 0
+
+    def _ach_load_game(self):
+        idx = self._ach_game_combo.current()
+        if idx < 0 or idx >= len(self.games):
+            return
+        self._ach_game_idx = idx
+        g = self.games[idx]
+        appid = g.get("appid","")
+        # Load schema from steam_settings/achievements.json if present
+        sd = os.path.join(g.get("dll_dir", g["path"]), "steam_settings", "achievements.json")
+        if os.path.isfile(sd):
+            try:
+                with open(sd, encoding="utf-8") as f:
+                    self._ach_schema = json.load(f)
+                self.log(f"[ach] loaded schema from steam_settings ({len(self._ach_schema)} achievements)", "ok")
+            except Exception:
+                self._ach_schema = []
+        else:
+            self._ach_schema = []
+        # Load save state
+        if appid:
+            self._ach_state = read_unlocked_achievements(appid)
+        else:
+            self._ach_state = {}
+        self._icon_refs.clear()
+        self._ach_render()
+        if self._ach_schema and appid:
+            sd_base = os.path.join(g.get("dll_dir", g["path"]), "steam_settings")
+            self._ach_preload_icons(appid, self._ach_schema, local_base=sd_base)
+
+    def _ach_fetch_schema(self):
+        idx = self._ach_game_idx
+        if idx is None or idx >= len(self.games):
+            self.log("[ach] select a game first", "warn"); return
+        g = self.games[idx]
+        appid = g.get("appid","").strip()
+        if not appid:
+            self.log("[ach] game has no AppID — fetch info or enter it manually", "warn"); return
+        def run():
+            self.log(f"[ach] fetching schema for AppID {appid}...", "act")
+            schema = fetch_achievements_schema(appid)
+            if not schema:
+                self.log("[ach] no achievements found (game may have no achievements or API unavailable)", "warn")
+                return
+            # Download icons → steam_settings/images/ and patch paths in schema
+            sd_dir     = os.path.join(g.get("dll_dir", g["path"]), "steam_settings")
+            images_dir = os.path.join(sd_dir, "images")
+            self.log(f"[ach] downloading {len(schema)} achievement icons...", "act")
+            schema = download_achievement_images(
+                appid, schema, images_dir, log_cb=lambda m: self.log(m, "act"))
+            self._ach_schema = schema
+            # Write achievements.json with local image paths
+            os.makedirs(sd_dir, exist_ok=True)
+            sd_path = os.path.join(sd_dir, "achievements.json")
+            with open(sd_path, "w", encoding="utf-8") as f:
+                json.dump(schema, f, indent=2, ensure_ascii=False)
+            self.log(f"[ach] wrote {len(schema)} achievements → {sd_path}", "ok")
+            # Reload save state + re-render
+            self._ach_state = read_unlocked_achievements(appid)
+            self._icon_refs.clear()
+            self.after(0, self._ach_render)
+            self._ach_preload_icons(appid, schema, local_base=sd_dir)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _ach_reload_saves(self):
+        idx = self._ach_game_idx
+        if idx is None or idx >= len(self.games): return
+        g = self.games[idx]
+        appid = g.get("appid","").strip()
+        if appid:
+            self._ach_state = read_unlocked_achievements(appid)
+        self._ach_render()
+
+    def _ach_render(self):
+        """Redraw the achievement list based on current schema, state, filter, search."""
+        for w in self._ach_frame.winfo_children():
+            w.destroy()
+
+        schema = self._ach_schema
+        state  = self._ach_state
+        filt   = self._ach_filter.get()
+        query  = self._ach_search.get().lower().strip()
+
+        if not schema:
+            tk.Label(self._ach_frame,
+                     text='Select a game and click "⬇ fetch schema" to load achievements.',
+                     font=("Consolas",10), fg=DARK["text2"],
+                     bg=DARK["surface"]).pack(pady=40, padx=20)
+            self._ach_stats_lbl.config(text="")
+            return
+
+        total    = len(schema)
+        unlocked = sum(1 for a in schema if state.get(a["name"],{}).get("earned", False))
+
+        # Filter + search
+        visible = []
+        for a in schema:
+            earned = state.get(a["name"], {}).get("earned", False)
+            if filt == "unlocked" and not earned: continue
+            if filt == "locked"   and earned:     continue
+            if query and query not in a.get("displayName","").lower()                      and query not in a.get("description","").lower()                      and query not in a["name"].lower():
+                continue
+            visible.append(a)
+
+        self._ach_stats_lbl.config(
+            text=f"  {unlocked}/{total} unlocked  |  showing {len(visible)}")
+
+        for a in visible:
+            name    = a["name"]
+            earned  = state.get(name, {}).get("earned", False)
+            e_time  = state.get(name, {}).get("earned_time", 0)
+            hidden  = str(a.get("hidden","0")) == "1"
+
+            bg      = DARK["green_bg"] if earned else DARK["surface"]
+            border  = "#1a3a28"        if earned else DARK["border"]
+
+            row = tk.Frame(self._ach_frame, bg=bg,
+                           highlightthickness=1, highlightbackground=border)
+            row.pack(fill="x", padx=6, pady=2)
+            inner = tk.Frame(row, bg=bg, padx=10, pady=6)
+            inner.pack(fill="x")
+
+            # Icon
+            idx2       = self._ach_game_idx
+            g2         = self.games[idx2] if idx2 is not None else {}
+            appid2     = g2.get("appid","")
+            sd_base    = os.path.join(g2.get("dll_dir", g2.get("path","")), "steam_settings")
+            icon_f     = a.get("icon","") if earned else a.get("icongray", a.get("icon",""))
+            photo      = load_icon_sync(appid2, icon_f, 36, local_base=sd_base) if appid2 else None
+            if photo is None:
+                photo = make_placeholder_icon(36, earned)
+            dot_color = DARK["green"] if earned else DARK["text2"]
+            dot_char  = "✓" if earned else "○"
+            icon_col = tk.Frame(inner, bg=bg)
+            icon_col.pack(side="left", padx=(0,10))
+            if photo:
+                self._icon_refs.append(photo)
+                tk.Label(icon_col, image=photo, bg=bg, bd=0).pack()
+            tk.Label(icon_col, text=dot_char, font=("Consolas",9,"bold"),
+                     fg=dot_color, bg=bg).pack()
+
+            info = tk.Frame(inner, bg=bg)
+            info.pack(side="left", fill="x", expand=True)
+
+            disp_name = a.get("displayName") or name
+            tk.Label(info, text=disp_name, font=("Consolas",10,"bold"),
+                     fg=DARK["green"] if earned else DARK["text"],
+                     bg=bg, anchor="w").pack(fill="x")
+
+            desc = a.get("description","")
+            if hidden and not desc:
+                desc = "(hidden achievement)"
+            if desc:
+                tk.Label(info, text=desc, font=("Consolas",8),
+                         fg=DARK["text2"], bg=bg, anchor="w",
+                         wraplength=480, justify="left").pack(fill="x")
+
+            if earned and e_time:
+                import datetime
+                dt = datetime.datetime.fromtimestamp(e_time).strftime("%Y-%m-%d %H:%M")
+                tk.Label(info, text=f"unlocked: {dt}", font=("Consolas",8),
+                         fg=DARK["accent"], bg=bg, anchor="w").pack(fill="x")
+
+            # api name (small)
+            tk.Label(info, text=name, font=("Consolas",7),
+                     fg=DARK["text2"], bg=bg, anchor="w").pack(fill="x")
+
+            # Unlock / Lock button
+            btn_frame = tk.Frame(inner, bg=bg)
+            btn_frame.pack(side="right")
+            if earned:
+                tk.Button(btn_frame, text="○ lock",
+                          command=lambda n=name: self._ach_set(n, False),
+                          **self._bs("ghost")).pack()
+            else:
+                tk.Button(btn_frame, text="✓ unlock",
+                          command=lambda n=name: self._ach_set(n, True),
+                          **self._bs("success")).pack()
+
+    def _ach_preload_icons(self, appid, schema, local_base=None):
+        def worker():
+            for a in schema:
+                load_icon_sync(appid, a.get("icon",""),    36, local_base=local_base)
+                load_icon_sync(appid, a.get("icongray",""),36, local_base=local_base)
+            self.after(0, self._ach_render)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ach_set(self, ach_name, unlock):
+        """Unlock or lock a single achievement and persist to disk."""
+        idx = self._ach_game_idx
+        if idx is None or idx >= len(self.games): return
+        g = self.games[idx]
+        appid = g.get("appid","").strip()
+        if not appid:
+            self.log("[ach] no AppID for this game", "warn"); return
+        if unlock:
+            self._ach_state[ach_name] = {
+                "earned": True,
+                "earned_time": int(time.time()),
+            }
+            self.log(f"[ach] unlocked: {ach_name}", "ok")
+        else:
+            self._ach_state[ach_name] = {"earned": False, "earned_time": 0}
+            self.log(f"[ach] locked: {ach_name}", "warn")
+        try:
+            write_unlocked_achievements(appid, self._ach_state)
+        except Exception as ex:
+            self.log(f"[ach] could not write save: {ex}", "err")
+        self._ach_render()
+
+    def _ach_unlock_all(self):
+        idx = self._ach_game_idx
+        if idx is None or idx >= len(self.games): return
+        g = self.games[idx]
+        appid = g.get("appid","").strip()
+        if not appid or not self._ach_schema:
+            self.log("[ach] no schema or AppID", "warn"); return
+        now = int(time.time())
+        for a in self._ach_schema:
+            self._ach_state[a["name"]] = {"earned": True, "earned_time": now}
+        write_unlocked_achievements(appid, self._ach_state)
+        self.log(f"[ach] unlocked all {len(self._ach_schema)} achievements", "ok")
+        self._ach_render()
+
+    def _ach_lock_all(self):
+        idx = self._ach_game_idx
+        if idx is None or idx >= len(self.games): return
+        g = self.games[idx]
+        appid = g.get("appid","").strip()
+        if not appid or not self._ach_schema:
+            self.log("[ach] no schema or AppID", "warn"); return
+        for a in self._ach_schema:
+            self._ach_state[a["name"]] = {"earned": False, "earned_time": 0}
+        write_unlocked_achievements(appid, self._ach_state)
+        self.log(f"[ach] locked all {len(self._ach_schema)} achievements", "warn")
+        self._ach_render()
+
+        # ── STYLE HELPERS ─────────────────────────────────────────────────────────
 
     def _mk_style(self):
         s = ttk.Style(self)
@@ -501,6 +1193,9 @@ class PatcherApp(tk.Tk):
             return
         for i, g in enumerate(self.games):
             self._game_card(i, g)
+        # Keep achievement tab game selector in sync
+        if hasattr(self, "_ach_game_combo"):
+            self._ach_update_combo()
 
     def _game_card(self, i, g):
         patched = g["patched"]
@@ -602,6 +1297,10 @@ class PatcherApp(tk.Tk):
 
     # ── AUTO DETECT ───────────────────────────────────────────────────────────
 
+    def _on_api_key_change(self):
+        """Sync the API key StringVar → runtime dict immediately."""
+        _RUNTIME_KEY["value"] = self.api_key.get().strip() or DEFAULT_STEAM_KEY
+
     def _on_close(self):
         """Save config then quit."""
         self._save_config()
@@ -609,10 +1308,11 @@ class PatcherApp(tk.Tk):
 
     def _save_config(self):
         data = {
-            "library_path": self.lib_path.get(),
-            "username":     self.username.get(),
-            "steamid":      self.steamid.get(),
-            "dll_path":     self._saved_dll,
+            "library_path":  self.lib_path.get(),
+            "username":      self.username.get(),
+            "steamid":       self.steamid.get(),
+            "dll_path":      self._saved_dll,
+            "steam_api_key": self.api_key.get().strip(),
         }
         save_config(data)
         self.log("Config saved.", "ok")
@@ -907,10 +1607,39 @@ class PatcherApp(tk.Tk):
                         f.write(content)
 
             self.log(f"  [{name}] steam_settings → {sd}", "ok")
+            # Auto-fetch achievement schema if we have an appid and it's not already there
+            ach_path = os.path.join(sd, "achievements.json")
+            appid_val = (game.get("_appid_var") and game["_appid_var"].get()) or game.get("appid","")
+            if appid_val and not os.path.isfile(ach_path):
+                threading.Thread(
+                    target=lambda g=game, ap=appid_val, sp=sd: self._auto_fetch_ach_schema(g, ap, sp),
+                    daemon=True).start()
             return True
         except Exception as ex:
             self.log(f"  [{name}] FAILED: {ex}", "err")
             return False
+
+    def _auto_fetch_ach_schema(self, game, appid, settings_dir):
+        """Background: fetch + write achievements.json after patching."""
+        try:
+            schema = fetch_achievements_schema(appid)
+            if schema:
+                # Download icons → steam_settings/images/
+                images_dir = os.path.join(settings_dir, "images")
+                schema = download_achievement_images(
+                    appid, schema, images_dir,
+                    log_cb=lambda m: self.log(m, "act"))
+                path = os.path.join(settings_dir, "achievements.json")
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(schema, f, indent=2, ensure_ascii=False)
+                self.log(f"  [{game['name']}] achievements.json written ({len(schema)} entries)", "ok")
+                # If this game is open in ach tab, refresh schema
+                idx = self._ach_game_idx
+                if idx is not None and idx < len(self.games) and self.games[idx]["name"] == game["name"]:
+                    self._ach_schema = schema
+                    self.after(0, self._ach_render)
+        except Exception as ex:
+            self.log(f"  [{game['name']}] ach schema fetch failed: {ex}", "warn")
 
     def _do_restore(self, game):
         dll_dir  = game.get("dll_dir") or game["path"]
