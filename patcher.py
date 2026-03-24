@@ -12,7 +12,7 @@ GBE_URL    = "https://github.com/Detanup01/gbe_fork/releases/latest/download/emu
 STEAM_API    = "https://store.steampowered.com/api/appdetails?appids={appid}&l=english"
 
 CONFIG_FILE      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patcher_config.json")
-DEFAULT_STEAM_KEY = "YourKEYHERE"  # fallback key, overridden by config
+DEFAULT_STEAM_KEY = "67949A6CF3E5D7517358620BB74E9EFC"  # fallback key, overridden by config
 
 DARK = {
     "bg":       "#0d0d0f",
@@ -125,13 +125,16 @@ def find_dll_in_tree(game_folder):
     for root, dirs, files in os.walk(game_folder):
         dirs[:] = [d for d in dirs if d.lower() not in SKIP]
         low = {f.lower() for f in files}
-        has64    = "steam_api64.dll"     in low
-        has32    = "steam_api.dll"       in low
-        bak64    = "steam_api64.dll.bak" in low
-        bak32    = "steam_api.dll.bak"   in low
-        if has64 or has32 or bak64 or bak32:
+        has64      = "steam_api64.dll"       in low
+        has32      = "steam_api.dll"         in low
+        has_client = "steamclient64.dll"     in low
+        bak64      = "steam_api64.dll.bak"   in low
+        bak32      = "steam_api.dll.bak"     in low
+        bak_client = "steamclient64.dll.bak" in low
+        if has64 or has32 or has_client or bak64 or bak32 or bak_client:
             return {"dll_dir": root, "has64": has64, "has32": has32,
-                    "has_bak64": bak64, "has_bak32": bak32}
+                    "has_client": has_client, "has_bak64": bak64,
+                    "has_bak32": bak32, "has_bak_client": bak_client}
     return None
 
 def fetch_steam_info(appid):
@@ -285,19 +288,21 @@ def scan_games(library_path):
 
             patched = result["has_bak64"] or result["has_bak32"]
             games.append({
-                "name":         folder_name,
-                "clean_name":   clean_name,     # sanitised for searching
-                "acf_name":     acf_name,       # official name from manifest
-                "path":         game_folder,
-                "dll_dir":      dll_dir,
-                "has64":        result["has64"],
-                "has32":        result["has32"],
-                "has_bak64":    result["has_bak64"],
-                "has_bak32":    result["has_bak32"],
-                "appid":        appid,
-                "patched":      patched,
-                "dlcs":         [],
-                "steam_fetched": False,
+                "name":           folder_name,
+                "clean_name":     clean_name,
+                "acf_name":       acf_name,
+                "path":           game_folder,
+                "dll_dir":        dll_dir,
+                "has64":          result["has64"],
+                "has32":          result["has32"],
+                "has_client":     result.get("has_client", False),
+                "has_bak64":      result["has_bak64"],
+                "has_bak32":      result["has_bak32"],
+                "has_bak_client": result.get("has_bak_client", False),
+                "appid":          appid,
+                "patched":        patched,
+                "dlcs":           [],
+                "steam_fetched":  False,
             })
     except Exception:
         pass
@@ -666,10 +671,13 @@ class PatcherApp(tk.Tk):
         _k = self._cfg.get("steam_api_key", DEFAULT_STEAM_KEY)
         self.api_key    = tk.StringVar(value=_k)
         _RUNTIME_KEY["value"] = _k  # apply immediately
-        self.gbe64      = None
-        self.gbe32      = None
-        self.dl_status  = tk.StringVar(value="")
-        self._saved_dll = self._cfg.get("dll_path", "")   # path to cached DLL on disk
+        self.gbe_api64    = None   # bytes for steam_api64.dll
+        self.gbe_client64 = None   # bytes for steamclient64.dll
+        self.gbe32        = None   # bytes for steam_api.dll (32-bit)
+        self.dl_api_status    = tk.StringVar(value="")
+        self.dl_client_status = tk.StringVar(value="")
+        self._saved_api64    = self._cfg.get("dll_api64_path", "")
+        self._saved_client64 = self._cfg.get("dll_client64_path", "")
 
         self._ach_game_idx  = None   # currently selected game in ach tab
         self._icon_refs     = []     # keep PhotoImage refs alive (prevent GC)
@@ -729,15 +737,26 @@ class PatcherApp(tk.Tk):
                   **self._bs("ghost")).pack(fill="x", pady=(2,10))
 
         tk.Frame(p, bg=DARK["border"], height=1).pack(fill="x", pady=6)
-        self._lbl(p, "GBE_FORK DLL")
-        self.dll_lbl = tk.Label(p, text="⬤ not loaded", font=("Consolas",9),
-                                fg=DARK["red"], bg=DARK["bg"], anchor="w")
-        self.dll_lbl.pack(fill="x", pady=(0,4))
+        self._lbl(p, "steam_api64.dll  (gbe_fork)")
+        self.dll_api_lbl = tk.Label(p, text="⬤ not loaded", font=("Consolas",9),
+                                    fg=DARK["red"], bg=DARK["bg"], anchor="w")
+        self.dll_api_lbl.pack(fill="x", pady=(0,4))
         tk.Button(p, text="⬇ download latest",
                   command=self._download_gbe, **self._bs("primary")).pack(fill="x", pady=2)
-        tk.Button(p, text="📂 load from file",
-                  command=self._load_dll_file, **self._bs("ghost")).pack(fill="x", pady=2)
-        tk.Label(p, textvariable=self.dl_status, font=("Consolas",8),
+        tk.Button(p, text="📂 load steam_api64.dll",
+                  command=self._load_api64_file, **self._bs("ghost")).pack(fill="x", pady=2)
+        tk.Label(p, textvariable=self.dl_api_status, font=("Consolas",8),
+                 fg=DARK["yellow"], bg=DARK["bg"], anchor="w",
+                 wraplength=230, justify="left").pack(fill="x", pady=(2,0))
+
+        tk.Frame(p, bg=DARK["border"], height=1).pack(fill="x", pady=6)
+        self._lbl(p, "steamclient64.dll  (gbe_fork)")
+        self.dll_client_lbl = tk.Label(p, text="⬤ not loaded", font=("Consolas",9),
+                                       fg=DARK["red"], bg=DARK["bg"], anchor="w")
+        self.dll_client_lbl.pack(fill="x", pady=(0,4))
+        tk.Button(p, text="📂 load steamclient64.dll",
+                  command=self._load_client64_file, **self._bs("ghost")).pack(fill="x", pady=2)
+        tk.Label(p, textvariable=self.dl_client_status, font=("Consolas",8),
                  fg=DARK["yellow"], bg=DARK["bg"], anchor="w",
                  wraplength=230, justify="left").pack(fill="x", pady=(2,0))
 
@@ -1228,9 +1247,10 @@ class PatcherApp(tk.Tk):
         rel      = os.path.relpath(dll_dir, g["path"])
         dll_info = f"dll in: {rel}" if rel != "." else "dll in: root"
         bits = []
-        if g["has64"]: bits.append("64-bit")
-        if g["has32"]: bits.append("32-bit")
-        if g["has_bak64"] or g["has_bak32"]: bits.append(".bak")
+        if g["has64"]:              bits.append("steam_api64")
+        if g["has32"]:              bits.append("steam_api")
+        if g.get("has_client"):     bits.append("steamclient64")
+        if g["has_bak64"] or g["has_bak32"] or g.get("has_bak_client"): bits.append(".bak")
         tk.Label(info, text=f"{dll_info}  |  {' '.join(bits)}",
                  font=("Consolas",8), fg=DARK["text2"], bg=bg, anchor="w").pack(fill="x")
 
@@ -1308,30 +1328,33 @@ class PatcherApp(tk.Tk):
 
     def _save_config(self):
         data = {
-            "library_path":  self.lib_path.get(),
-            "username":      self.username.get(),
-            "steamid":       self.steamid.get(),
-            "dll_path":      self._saved_dll,
-            "steam_api_key": self.api_key.get().strip(),
+            "library_path":     self.lib_path.get(),
+            "username":         self.username.get(),
+            "steamid":          self.steamid.get(),
+            "dll_api64_path":   self._saved_api64,
+            "dll_client64_path": self._saved_client64,
+            "steam_api_key":    self.api_key.get().strip(),
         }
         save_config(data)
         self.log("Config saved.", "ok")
 
     def _load_saved_dll(self):
-        """On startup, re-load the DLL from the path saved in config."""
-        path = self._saved_dll
-        if path and os.path.isfile(path):
-            try:
-                with open(path, "rb") as f:
-                    data = f.read()
-                if "64" in os.path.basename(path).lower():
-                    self.gbe64 = data
-                else:
-                    self.gbe32 = data
-                self.dll_lbl.config(text=f"⬤ ready ({os.path.basename(path)})", fg=DARK["green"])
-                self.log(f"DLL loaded from saved path: {path}", "ok")
-            except Exception as ex:
-                self.log(f"Could not reload saved DLL: {ex}", "warn")
+        """On startup, reload both DLLs from paths saved in config."""
+        for path, attr, lbl, status in [
+            (self._saved_api64,    "gbe_api64",    "dll_api_lbl",    "dl_api_status"),
+            (self._saved_client64, "gbe_client64", "dll_client_lbl", "dl_client_status"),
+        ]:
+            if path and os.path.isfile(path):
+                try:
+                    with open(path, "rb") as f:
+                        setattr(self, attr, f.read())
+                    getattr(self, lbl).config(
+                        text=f"⬤ {os.path.basename(path)}", fg=DARK["green"])
+                    getattr(self, status).set(f"Loaded: {os.path.basename(path)}")
+                    self.log(f"Reloaded {os.path.basename(path)} from config", "ok")
+                except Exception as ex:
+                    self.log(f"Could not reload {path}: {ex}", "warn")
+
 
     def _auto_detect(self):
         paths = find_steam_paths()
@@ -1483,17 +1506,17 @@ class PatcherApp(tk.Tk):
     # ── DOWNLOAD GBE DLL ──────────────────────────────────────────────────────
 
     def _download_gbe(self):
-        self.dl_status.set("Downloading...")
-        self.dll_lbl.config(text="⬤ downloading...", fg=DARK["yellow"])
+        self.dl_api_status.set("Downloading...")
+        self.dll_api_lbl.config(text="⬤ downloading...", fg=DARK["yellow"])
         threading.Thread(target=self._dl_thread, daemon=True).start()
 
     def _dl_thread(self):
         try:
-            self.after(0, lambda: self.dl_status.set("Connecting to GitHub..."))
+            self.after(0, lambda: self.dl_api_status.set("Connecting to GitHub..."))
             req = urllib.request.Request(GBE_URL, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 data = r.read()
-            self.after(0, lambda: self.dl_status.set("Extracting..."))
+            self.after(0, lambda: self.dl_api_status.set("Extracting..."))
             zf = zipfile.ZipFile(io.BytesIO(data))
             names = zf.namelist()
             dll64 = next((n for n in names
@@ -1503,39 +1526,52 @@ class PatcherApp(tk.Tk):
                           if n.lower().endswith("steam_api.dll")
                           and "64" not in n.lower()
                           and "experimental" not in n.lower()), None)
-            if dll64: self.gbe64 = zf.read(dll64); self.log(f"DLL64: {dll64}", "ok")
-            if dll32: self.gbe32 = zf.read(dll32); self.log(f"DLL32: {dll32}", "ok")
-            if self.gbe64 or self.gbe32:
-                # Cache DLL to disk next to script so it survives restarts
+            if dll64:
+                self.gbe_api64 = zf.read(dll64)
+                self.log(f"steam_api64.dll extracted: {dll64}", "ok")
                 cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gbe_steam_api64.dll")
-                try:
-                    if self.gbe64:
-                        with open(cache_path, "wb") as _f: _f.write(self.gbe64)
-                        self._saved_dll = cache_path
-                        self._save_config()
-                except Exception: pass
-                self.after(0, lambda: self.dll_lbl.config(text="⬤ ready", fg=DARK["green"]))
-                self.after(0, lambda: self.dl_status.set("✓ Downloaded!"))
-                self.log("gbe_fork DLL ready.", "ok")
+                with open(cache_path, "wb") as _f: _f.write(self.gbe_api64)
+                self._saved_api64 = cache_path
+            if dll32:
+                self.gbe32 = zf.read(dll32)
+                self.log(f"steam_api.dll extracted: {dll32}", "ok")
+            if self.gbe_api64 or self.gbe32:
+                self._save_config()
+                self.after(0, lambda: self.dll_api_lbl.config(text="⬤ ready", fg=DARK["green"]))
+                self.after(0, lambda: self.dl_api_status.set("✓ Downloaded!"))
+                self.log("gbe_fork steam_api64.dll ready.", "ok")
             else:
-                raise Exception("DLL not found in zip.")
+                raise Exception("steam_api64.dll not found in zip.")
         except Exception as ex:
             self.log(f"Download failed: {ex}", "err")
-            self.after(0, lambda: self.dl_status.set(f"Error: {ex}"))
-            self.after(0, lambda: self.dll_lbl.config(text="⬤ failed", fg=DARK["red"]))
+            self.after(0, lambda: self.dl_api_status.set(f"Error: {ex}"))
+            self.after(0, lambda: self.dll_api_lbl.config(text="⬤ failed", fg=DARK["red"]))
 
-    def _load_dll_file(self):
+    def _load_api64_file(self):
         path = filedialog.askopenfilename(
             title="Select gbe_fork steam_api64.dll",
             filetypes=[("DLL","*.dll"),("All","*.*")])
         if path:
             with open(path, "rb") as f:
-                self.gbe64 = f.read()
-            self._saved_dll = path
+                self.gbe_api64 = f.read()
+            self._saved_api64 = path
             self._save_config()
-            self.dll_lbl.config(text="⬤ ready (manual)", fg=DARK["green"])
-            self.dl_status.set(f"Loaded: {os.path.basename(path)}")
-            self.log(f"DLL loaded: {path}", "ok")
+            self.dll_api_lbl.config(text=f"⬤ {os.path.basename(path)}", fg=DARK["green"])
+            self.dl_api_status.set(f"Loaded: {os.path.basename(path)}")
+            self.log(f"steam_api64.dll loaded: {path}", "ok")
+
+    def _load_client64_file(self):
+        path = filedialog.askopenfilename(
+            title="Select gbe_fork steamclient64.dll",
+            filetypes=[("DLL","*.dll"),("All","*.*")])
+        if path:
+            with open(path, "rb") as f:
+                self.gbe_client64 = f.read()
+            self._saved_client64 = path
+            self._save_config()
+            self.dll_client_lbl.config(text=f"⬤ {os.path.basename(path)}", fg=DARK["green"])
+            self.dl_client_status.set(f"Loaded: {os.path.basename(path)}")
+            self.log(f"steamclient64.dll loaded: {path}", "ok")
 
     # ── PATCH / RESTORE ───────────────────────────────────────────────────────
 
@@ -1560,20 +1596,20 @@ class PatcherApp(tk.Tk):
         }
 
     def _do_patch(self, game):
-        if not self.gbe64 and not self.gbe32:
-            self.log("No DLL loaded — download or load gbe_fork first.", "err")
+        if not self.gbe_api64 and not self.gbe32:
+            self.log("No DLL loaded — load steam_api64.dll first.", "err")
             return False
         dll_dir   = game.get("dll_dir") or game["path"]
         game_root = game["path"]
         name      = game["name"]
         try:
-            if game["has64"] and self.gbe64:
+            if game["has64"] and self.gbe_api64:
                 orig = os.path.join(dll_dir, "steam_api64.dll")
                 bak  = os.path.join(dll_dir, "steam_api64.dll.bak")
                 if not os.path.isfile(bak):
                     shutil.copy2(orig, bak)
                     self.log(f"  [{name}] backed up steam_api64.dll", "ok")
-                with open(orig, "wb") as f: f.write(self.gbe64)
+                with open(orig, "wb") as f: f.write(self.gbe_api64)
                 self.log(f"  [{name}] patched steam_api64.dll", "ok")
 
             if game["has32"] and self.gbe32:
@@ -1584,6 +1620,15 @@ class PatcherApp(tk.Tk):
                     self.log(f"  [{name}] backed up steam_api.dll", "ok")
                 with open(orig32, "wb") as f: f.write(self.gbe32)
                 self.log(f"  [{name}] patched steam_api.dll", "ok")
+
+            if game.get("has_client") and self.gbe_client64:
+                orig_cl = os.path.join(dll_dir, "steamclient64.dll")
+                bak_cl  = os.path.join(dll_dir, "steamclient64.dll.bak")
+                if not os.path.isfile(bak_cl):
+                    shutil.copy2(orig_cl, bak_cl)
+                    self.log(f"  [{name}] backed up steamclient64.dll", "ok")
+                with open(orig_cl, "wb") as f: f.write(self.gbe_client64)
+                self.log(f"  [{name}] patched steamclient64.dll", "ok")
 
             # Write steam_settings/ next to the DLL
             sd = os.path.join(dll_dir, "steam_settings")
@@ -1645,8 +1690,9 @@ class PatcherApp(tk.Tk):
         dll_dir  = game.get("dll_dir") or game["path"]
         name     = game["name"]
         restored = False
-        for dll, bak in [("steam_api64.dll","steam_api64.dll.bak"),
-                         ("steam_api.dll",  "steam_api.dll.bak")]:
+        for dll, bak in [("steam_api64.dll",   "steam_api64.dll.bak"),
+                         ("steam_api.dll",     "steam_api.dll.bak"),
+                         ("steamclient64.dll", "steamclient64.dll.bak")]:
             bp = os.path.join(dll_dir, bak)
             dp = os.path.join(dll_dir, dll)
             if os.path.isfile(bp):
@@ -1664,15 +1710,18 @@ class PatcherApp(tk.Tk):
             if ok:
                 self.games[i]["patched"]   = True
                 self.games[i]["has_bak64"] = True
+                if self.games[i].get("has_client"):
+                    self.games[i]["has_bak_client"] = True
             self.after(0, self._render_games)
         threading.Thread(target=run, daemon=True).start()
 
     def _restore_one(self, i):
         def run():
             self._do_restore(self.games[i])
-            self.games[i]["patched"]   = False
-            self.games[i]["has_bak64"] = False
-            self.games[i]["has_bak32"] = False
+            self.games[i]["patched"]         = False
+            self.games[i]["has_bak64"]       = False
+            self.games[i]["has_bak32"]       = False
+            self.games[i]["has_bak_client"]  = False
             self.after(0, self._render_games)
         threading.Thread(target=run, daemon=True).start()
 
@@ -1682,7 +1731,10 @@ class PatcherApp(tk.Tk):
             self.log(f"Patching {len(targets)} game(s)...", "act")
             for g in targets:
                 if self._do_patch(g):
-                    g["patched"] = True; g["has_bak64"] = True
+                    g["patched"] = True
+                    g["has_bak64"] = True
+                    if g.get("has_client"):
+                        g["has_bak_client"] = True
             self.log("Patch all done.", "ok")
             self.after(0, self._render_games)
         threading.Thread(target=run, daemon=True).start()
@@ -1693,7 +1745,10 @@ class PatcherApp(tk.Tk):
             self.log(f"Restoring {len(targets)} game(s)...", "act")
             for g in targets:
                 self._do_restore(g)
-                g["patched"] = False; g["has_bak64"] = False; g["has_bak32"] = False
+                g["patched"] = False
+                g["has_bak64"] = False
+                g["has_bak32"] = False
+                g["has_bak_client"] = False
             self.log("Restore all done.", "ok")
             self.after(0, self._render_games)
         threading.Thread(target=run, daemon=True).start()
