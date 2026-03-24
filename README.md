@@ -3,27 +3,28 @@
 
 # gbe_fork Auto Patcher
 
-A Windows GUI tool that automatically patches Steam games with the [gbe_fork](https://github.com/Detanup01/gbe_fork) Steam emulator. Scans your Steam library, detects games, fetches info from the Steam Store API, generates all required configs, downloads achievement icons, and replaces `steam_api64.dll` / `steam_api.dll` in one click.
+A Windows GUI tool that automatically patches Steam games with the [gbe_fork](https://github.com/Detanup01/gbe_fork) Steam emulator. Scans your Steam library, detects games, fetches info from the Steam Store and Steam API, generates all required configs, downloads achievement icons, and replaces `steam_api64.dll`, `steam_api.dll`, and `steamclient64.dll` in one click.
 
 ---
 
 ## Features
 
 - **Auto-detects Steam library** from the Windows registry, including extra library folders from `libraryfolders.vdf`
-- **Recursive DLL scan** — finds `steam_api64.dll` / `steam_api.dll` no matter how deep in the game folder tree
+- **Recursive DLL scan** — finds `steam_api64.dll`, `steam_api.dll`, and `steamclient64.dll` no matter how deep in the game folder tree
 - **AppID from `.acf` manifests** — reads `appmanifest_*.acf` files for reliable AppID detection without any API calls
 - **Smart name cleaning** — strips repack/scene tags from folder names before searching (e.g. `Until Dawn (SteamRip)` → `Until Dawn`)
 - **Steam Store API integration** — auto-fetches official game names and full DLC lists per game
 - **AppID search by name** — searches `store.steampowered.com` using the cleaned folder name for games without a manifest
 - **Auto-generates all gbe_fork configs** inside `steam_settings/` next to the DLL
 - **DLC.txt generation** — writes all DLC entries in gbe_fork format on patch
-- **Backup & restore** — renames the original DLL to `.bak` before patching; one-click restore
+- **Backup & restore** — renames original DLLs to `.bak` before patching; one-click restore
+- **Two separate DLL slots** — load `steam_api64.dll` and `steamclient64.dll` independently, each with its own path saved to config
 - **Persistent config** — saves all settings to `patcher_config.json` so nothing needs to be re-entered on restart
-- **Download gbe_fork DLL automatically** from the latest GitHub release, or load one manually
-- **Achievement tab** — browse, unlock, and lock achievements per game
-- **Achievement schema fetch** — pulls full achievement definitions (name, description, icons) via Steam API
+- **Download gbe_fork DLL automatically** — fetches `steam_api64.dll` from the latest GitHub release; `steamclient64.dll` is loaded manually
+- **Achievement tab** — browse, unlock, and lock achievements per game with full icon display
+- **Achievement schema fetch** — pulls full achievement definitions (name, display name, description, icons) via Steam API
 - **Local icon download** — saves color and gray achievement icons to `steam_settings/images/` and patches `achievements.json` with local paths
-- **Configurable Steam API key** — stored in `patcher_config.json`, editable from the UI
+- **Configurable Steam API key** — stored in `patcher_config.json`, editable from the UI at any time
 
 ---
 
@@ -31,8 +32,13 @@ A Windows GUI tool that automatically patches Steam games with the [gbe_fork](ht
 
 - Windows 10 / 11
 - Python 3.8 or newer
-- [Pillow](https://pypi.org/project/pillow/) — for achievement icon display (`pip install pillow`)
-- No other external packages — uses only Python standard library
+- [Pillow](https://pypi.org/project/pillow/) for achievement icon display
+
+```bash
+pip install pillow
+```
+
+No other external packages needed — everything else uses the Python standard library.
 
 ---
 
@@ -47,7 +53,7 @@ python patcher.py
 
 ## Building a standalone `.exe`
 
-Run `build.bat` on Windows. It installs PyInstaller + Pillow and produces `dist\gbe_fork_Patcher.exe`.
+Run `build.bat` on Windows. It installs PyInstaller and Pillow automatically, then produces `dist\gbe_fork_Patcher.exe` — no Python required to run it.
 
 ```
 build.bat
@@ -58,11 +64,12 @@ build.bat
 ## First-time setup
 
 1. Launch the app — it auto-detects your Steam library and scans for games.
-2. Click **⬇ download latest** to fetch the gbe_fork DLL from GitHub, or **📂 load from file** to use one you already have.
-3. Set your **Username** and **Steam ID 64** in the left panel (a random ID is pre-filled).
-4. Enter your **Steam API Key** in the left panel (a default key is pre-filled).
-5. Click **🔍 search AppIDs by name** to auto-fill missing AppIDs, then **⬇ fetch ALL from Steam** to pull game names and DLC lists.
-6. Click **⚡ patch ALL** to patch every game, or **⚡ patch** on individual games.
+2. Under **steam_api64.dll**, click **⬇ download latest** to fetch it from GitHub automatically, or **📂 load steam_api64.dll** to use one you already have.
+3. Under **steamclient64.dll**, click **📂 load steamclient64.dll** to load it manually.
+4. Set your **Username** and **Steam ID 64** in the left panel (a random ID is pre-filled).
+5. Enter or verify the **Steam API Key** in the left panel.
+6. Click **🔍 search AppIDs by name** to auto-fill missing AppIDs, then **⬇ fetch ALL from Steam** to pull game names and DLC lists.
+7. Click **⚡ patch ALL** to patch every game at once, or **⚡ patch** on individual games.
 
 All settings are saved automatically to `patcher_config.json` and restored on next launch.
 
@@ -72,9 +79,9 @@ All settings are saved automatically to `patcher_config.json` and restored on ne
 
 For each game the patcher:
 
-1. Locates the exact folder containing `steam_api64.dll` or `steam_api.dll` (walks the full directory tree)
-2. Renames the original DLL to `steam_api64.dll.bak` (backup)
-3. Writes the gbe_fork DLL in its place
+1. Locates the exact folder containing the DLL(s) by walking the full directory tree
+2. Renames each original DLL to `.bak` (backup)
+3. Writes the corresponding gbe_fork DLL in its place
 4. Creates `steam_settings/` next to the DLL containing:
 
 | File | Purpose |
@@ -89,6 +96,18 @@ For each game the patcher:
 
 5. Writes `steam_appid.txt` next to the DLL and at the game root
 6. Fetches achievement schema in the background and downloads all icons
+
+---
+
+## DLLs replaced
+
+| Original file | Replaced with | Source |
+|---|---|---|
+| `steam_api64.dll` | gbe_fork `steam_api64.dll` | Auto-downloaded from GitHub or loaded manually |
+| `steam_api.dll` | gbe_fork `steam_api.dll` (32-bit) | Extracted from the same GitHub release zip |
+| `steamclient64.dll` | gbe_fork `steamclient64.dll` | Loaded manually |
+
+Each DLL is backed up as `<name>.bak` before replacement. Restore at any time with the **↩ restore** button.
 
 ---
 
@@ -141,7 +160,7 @@ language=english
 
 Select a game from the dropdown at the top of the **🏆 achievements** tab, then:
 
-- **⬇ fetch schema** — downloads achievement definitions + all icons from Steam API
+- **⬇ fetch schema** — downloads full achievement definitions + all icons from Steam API
 - **↺ reload saves** — re-reads the gbe_fork save file from disk
 - **✓ unlock** / **○ lock** — toggle individual achievements instantly
 - **✓ unlock ALL** / **○ lock ALL** — bulk operations
@@ -157,13 +176,12 @@ Achievement save state is read from and written to:
 
 ## Achievement icon pipeline
 
-When schema is fetched:
+When the schema is fetched:
 
 1. Downloads color icon (`icon`) → `steam_settings/images/<ACH_NAME>.jpg`
 2. Downloads gray icon (`icongray`) → `steam_settings/images/<ACH_NAME>_gray.jpg`
-3. Replaces URL fields in `achievements.json` with local relative paths
-
-Icons are loaded from disk on subsequent opens — no network needed after first fetch.
+3. Replaces the URL fields in `achievements.json` with local relative paths
+4. On subsequent opens, icons are loaded from disk — no network needed
 
 ---
 
@@ -185,19 +203,20 @@ Stripped tags include: `SteamRip`, `FitGirl`, `CODEX`, `SKIDROW`, `CPY`, `PLAZA`
 
 ## Persistent config
 
-`patcher_config.json` (next to the script/exe):
+`patcher_config.json` is saved next to the script/exe and loaded on every launch:
 
 ```json
 {
-  "library_path": "C:\\Program Files (x86)\\Steam\\steamapps\\common",
-  "username": "Player",
-  "steamid": "76561198012345678",
-  "dll_path": "C:\\path\\to\\gbe_steam_api64.dll",
-  "steam_api_key": "YOUR_STEAM_API_KEY"
+  "library_path":      "C:\\Program Files (x86)\\Steam\\steamapps\\common",
+  "username":          "Player",
+  "steamid":           "76561198012345678",
+  "dll_api64_path":    "C:\\path\\to\\gbe_steam_api64.dll",
+  "dll_client64_path": "C:\\path\\to\\steamclient64.dll",
+  "steam_api_key":     "YOUR_STEAM_API_KEY"
 }
 ```
 
-Saved automatically on close, on library browse, and on DLL load/download. Editable manually.
+Saved automatically on close, on library browse, and whenever a DLL is loaded or downloaded. Can be edited manually.
 
 ---
 
@@ -205,11 +224,11 @@ Saved automatically on close, on library browse, and on DLL load/download. Edita
 
 ```
 gbe_patcher/
-├── patcher.py              # Main application
-├── build.bat               # Build script (.exe via PyInstaller)
-├── patcher_config.json     # Auto-generated on first save
-├── gbe_steam_api64.dll     # Cached gbe_fork DLL (auto-downloaded)
-├── ach_icons/              # Remote icon cache (URL downloads)
+├── patcher.py               # Main application
+├── build.bat                # Build script (.exe via PyInstaller)
+├── patcher_config.json      # Auto-generated on first save
+├── gbe_steam_api64.dll      # Cached steam_api64.dll (auto-downloaded)
+├── ach_icons/               # Remote icon disk cache
 └── README.md
 ```
 
@@ -217,8 +236,10 @@ After patching a game:
 
 ```
 GameFolder/
-├── steam_api64.dll         # gbe_fork DLL (replaced)
-├── steam_api64.dll.bak     # Original Steam DLL (backup)
+├── steam_api64.dll          # gbe_fork DLL (replaced)
+├── steam_api64.dll.bak      # Original (backup)
+├── steamclient64.dll        # gbe_fork DLL (replaced)
+├── steamclient64.dll.bak    # Original (backup)
 ├── steam_appid.txt
 └── steam_settings/
     ├── configs.main.ini
@@ -237,7 +258,7 @@ GameFolder/
 
 ## Restoring original DLLs
 
-Click **↩ restore** on a patched game to swap the `.bak` back. Click **↩ restore ALL** to restore everything at once.
+Click **↩ restore** on a patched game to swap all `.bak` files back. Click **↩ restore ALL** to restore every patched game at once. The patcher restores `steam_api64.dll`, `steam_api.dll`, and `steamclient64.dll` in a single operation.
 
 ---
 
